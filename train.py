@@ -1055,7 +1055,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ),
             # AlternatingSingleFootReward(scale=1.0),
             FeetAirtimeReward(scale=0.1),
-            MinStrideLengthPenalty(scale=-1.0),
+            MinStrideLengthPenalty(scale=-0.05),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1296,8 +1296,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=4096,
-            batch_size=512,
+            num_envs=8,
+            batch_size=2,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
