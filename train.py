@@ -1,4 +1,21 @@
-"""Defines simple task for training a joystick walking policy for K-Bot."""
+"""Defines simple task for training a joystick walking policy for K-Bot.
+
+This implementation includes CAPS (Conditioning for Action Policy Smoothness) regularization
+to improve policy smoothness and reduce high-frequency oscillations in the actions.
+
+CAPS Implementation:
+- Temporal Smoothness Loss (L_T): Penalizes differences between consecutive actions
+- Spatial Smoothness Loss (L_S): Penalizes differences between actions from similar states
+- The total loss is: J_total = J_policy + λ_T * L_T + λ_S * L_S
+
+Key CAPS Parameters:
+- lambda_t: Temporal smoothness coefficient (default: 1.0)
+- lambda_s: Spatial smoothness coefficient (default: 0.1)  
+- spatial_noise_std: Standard deviation for spatial perturbation (default: 0.05)
+
+This replaces traditional acceleration and jerk penalties with a more principled approach
+to policy smoothness that is robust across different environments and robot configurations.
+"""
 
 import asyncio
 import functools
@@ -94,6 +111,20 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
     min_level_steps: int = xax.field(
         value=1,
         help="The minimum number of steps to wait before changing the curriculum level.",
+    )
+
+    # CAPS parameters.
+    lambda_t: float = xax.field(
+        value=1.0,
+        help="Temporal smoothness loss coefficient for CAPS.",
+    )
+    lambda_s: float = xax.field(
+        value=0.1,
+        help="Spatial smoothness loss coefficient for CAPS.",
+    )
+    spatial_noise_std: float = xax.field(
+        value=0.05,
+        help="Standard deviation of Gaussian noise for spatial perturbation in CAPS.",
     )
 
     # Optimizer parameters.
@@ -829,6 +860,39 @@ class Model(eqx.Module):
         )
 
 
+def compute_smoothness_metric(actions: Array, sampling_frequency: float) -> Array:
+    """Compute the smoothness metric from CAPS paper using FFT analysis.
+    
+    Args:
+        actions: Action sequence of shape (T, action_dim)
+        sampling_frequency: Sampling frequency of the actions (Hz)
+        
+    Returns:
+        Smoothness metric value (lower is smoother)
+    """
+    T, action_dim = actions.shape
+    
+    # Compute FFT for each action dimension
+    fft_result = jnp.fft.fft(actions, axis=0)
+    frequencies = jnp.fft.fftfreq(T, 1.0 / sampling_frequency)
+    
+    # Take magnitude of FFT coefficients
+    magnitude = jnp.abs(fft_result)
+    
+    # Compute smoothness metric: Sm = (2 / (n * fs)) * Σ M_i * f_i
+    # Only use positive frequencies (first half)
+    n_pos = T // 2
+    magnitude_pos = magnitude[:n_pos]
+    frequencies_pos = frequencies[:n_pos]
+    
+    # Weight by frequency and sum
+    weighted_sum = jnp.sum(magnitude_pos * jnp.abs(frequencies_pos[:, None]), axis=0)
+    smoothness = (2.0 / (T * sampling_frequency)) * weighted_sum
+    
+    # Average across action dimensions
+    return jnp.mean(smoothness)
+
+
 class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
@@ -984,11 +1048,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.UprightReward(scale=0.5),
             # Normalisation penalties.
             ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01, scale_by_curriculum=True),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
             ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.005, scale_by_curriculum=True),
             ksim.LinearVelocityPenalty(index=("z",), scale=-0.005, scale_by_curriculum=True),
             # Bespoke rewards.
@@ -1011,6 +1070,23 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.NotUprightTermination(max_radians=math.radians(60)),
             ksim.FarFromOriginTermination(max_dist=10.0),
         ]
+
+    def get_ppo_metrics(
+        self,
+        losses_t: dict[str, Array],
+        ppo_inputs: ksim.PPOInputs,
+        on_policy_variables: ksim.PPOVariables,
+        off_policy_variables: ksim.PPOVariables,
+    ) -> dict[str, Array]:
+        # Get default PPO metrics
+        metrics = super().get_ppo_metrics(losses_t, ppo_inputs, on_policy_variables, off_policy_variables)
+        
+        # Add CAPS-specific metrics
+        if off_policy_variables.aux_losses is not None:
+            for aux_loss_name, aux_loss_value in off_policy_variables.aux_losses.items():
+                metrics[f"caps_{aux_loss_name}"] = aux_loss_value.mean()
+        
+        return metrics
 
     def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
         return ksim.EpisodeLengthCurriculum(
@@ -1182,9 +1258,46 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             carry=critic_carry,
         )
 
+        # CAPS: Compute spatial smoothness loss
+        caps_losses = {}
+        
+        # Sample current action for spatial comparison
+        rng_current, rng = jax.random.split(rng)
+        current_action = actor_dist.sample(seed=rng_current)
+        
+        # Spatial smoothness: penalize difference between actions from similar states
+        rng_spatial, rng = jax.random.split(rng)
+        
+        # Create perturbed observations
+        perturbed_obs_dict = {}
+        for key, obs_val in transition.obs.items():
+            noise = jax.random.normal(rng_spatial, obs_val.shape) * self.config.spatial_noise_std
+            perturbed_obs_dict[key] = obs_val + noise
+        perturbed_obs = xax.FrozenDict(perturbed_obs_dict)
+        
+        # Run actor on perturbed observations
+        perturbed_actor_dist, _ = self.run_actor(
+            model=model.actor,
+            observations=perturbed_obs,
+            commands=transition.command,
+            carry=actor_carry,
+        )
+        
+        # Sample action from perturbed state
+        rng_perturbed, rng = jax.random.split(rng)
+        perturbed_action = perturbed_actor_dist.sample(seed=rng_perturbed)
+        
+        # Spatial smoothness loss
+        spatial_loss = jnp.mean((current_action - perturbed_action) ** 2) * self.config.lambda_s
+        caps_losses["caps_spatial"] = spatial_loss
+        
+        # Initialize temporal loss (will be replaced in get_ppo_variables)
+        caps_losses["caps_temporal"] = jnp.array(0.0)
+
         transition_ppo_variables = ksim.PPOVariables(
             log_probs=log_probs,
             values=value.squeeze(-1),
+            aux_losses=caps_losses,
         )
 
         next_carry = jax.tree.map(
@@ -1209,6 +1322,30 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             (trajectory, jax.random.split(rng, len(trajectory.done))),
             jit_level=4,
         )
+        
+        # Post-process CAPS losses using actual consecutive actions
+        if hasattr(ppo_variables, 'aux_losses') and ppo_variables.aux_losses is not None:
+            aux_losses = dict(ppo_variables.aux_losses)
+            
+            # Compute proper temporal smoothness loss using consecutive actions from trajectory
+            actions = trajectory.action  # Shape: (T, action_dim)
+            # Temporal smoothness: ||a_t - a_{t+1}||^2
+            actions_current = actions[:-1]  # (T-1, action_dim)
+            actions_next = actions[1:]      # (T-1, action_dim)
+            temporal_diff = actions_current - actions_next
+            temporal_loss_per_step = jnp.mean(temporal_diff ** 2, axis=-1)  # (T-1,)
+            
+            # Pad to match trajectory length and scale by lambda_t
+            temporal_loss_padded = jnp.concatenate([temporal_loss_per_step, jnp.array([0.0])]) * self.config.lambda_t
+            aux_losses["caps_temporal"] = temporal_loss_padded
+            
+            # Keep spatial loss as computed in scan function (already scaled by lambda_s)
+            ppo_variables = ksim.PPOVariables(
+                log_probs=ppo_variables.log_probs,
+                values=ppo_variables.values,
+                aux_losses=aux_losses,
+            )
+        
         return ppo_variables, next_model_carry
 
     def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
@@ -1243,8 +1380,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=4096,
-            batch_size=256,
+            num_envs=8,
+            batch_size=2,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
