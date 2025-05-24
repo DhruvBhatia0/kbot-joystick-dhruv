@@ -106,6 +106,58 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         help="Weight decay for the Adam optimizer.",
     )
 
+@attrs.define(frozen=True, kw_only=True)
+class MinStrideLengthPenalty(ksim.Reward):
+    """Penalise strides shorter than `min_stride` meters at each touchdown."""
+    scale: float = -1.0
+    min_stride: float = 0.15
+    feet_pos_obs_name: str = "feet_position_observation"      # (x,y,z) for each foot
+    feet_contact_obs_name: str = "feet_contact_observation"  # booleans for each foot
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        # foot positions: shape (T, 6) → [xL,yL,zL,  xR,yR,zR]
+        foot_pos = traj.obs[self.feet_pos_obs_name]
+        # contact flags: shape (T, 4) → two geoms per foot, so any(axis=-1) → (T,) per foot
+        contact = traj.obs[self.feet_contact_obs_name]
+        left_in  = jnp.any(contact[..., :2] > 0.5, axis=-1)
+        right_in = jnp.any(contact[..., 2:] > 0.5, axis=-1)
+
+        def _foot_penalty(pos_2d: Array, in_contact: Array) -> Array:
+            # pos_2d: (T,2) history of that foot’s x,y
+            # in_contact: (T,) boolean
+            def _scan(carry, inputs):
+                prev_in, last_liftoff_pos = carry
+                pos, curr_in = inputs
+
+                liftoff   = prev_in & (~curr_in)
+                touchdown = (~prev_in) & curr_in
+
+                # when liftoff: latch the foot’s last pos
+                new_last_liftoff = jnp.where(liftoff[...,None], pos, last_liftoff_pos)
+                # at touchdown compute stride length
+                stride_len = jnp.linalg.norm(pos - new_last_liftoff, axis=-1)
+                # penalty = scale * normalized shortfall
+                penalty = jnp.where(
+                    touchdown,
+                    self.scale * jnp.clip((self.min_stride - stride_len) / self.min_stride, 0.0, 1.0),
+                    0.0,
+                )
+                return (curr_in, new_last_liftoff), penalty
+
+            # init: assume in_contact[0] and last liftoff pos = first pos
+            init = (in_contact[0], pos_2d[0])
+            _, penalties = jax.lax.scan(_scan, init, (pos_2d, in_contact))
+            return penalties
+
+        # run for left and right
+        left_xy  = foot_pos[..., :2]
+        right_xy = foot_pos[..., 3:5]
+        left_pen  = _foot_penalty(left_xy, left_in)
+        right_pen = _foot_penalty(right_xy, right_in)
+
+        # total penalty per timestep
+        return left_pen + right_pen
+
 
 @attrs.define(frozen=True, kw_only=True)
 class FeetPhaseReward(ksim.Reward):
@@ -994,8 +1046,8 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             # Bespoke rewards.
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.2),
-            AnkleKneePenalty.create_penalty(physics_model, scale=-0.1),
-            FeetPhaseReward(scale=2.1, max_foot_height=0.18, stand_still_threshold=self.config.stand_still_threshold),
+            AnkleKneePenalty.create_penalty(physics_model, scale=-0.01),
+            FeetPhaseReward(scale=0.5, max_foot_height=0.18, stand_still_threshold=self.config.stand_still_threshold),
             FeetSlipPenalty(scale=-0.25),
             ContactForcePenalty(
                 scale=-0.03,
@@ -1003,6 +1055,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ),
             # AlternatingSingleFootReward(scale=1.0),
             FeetAirtimeReward(scale=0.1),
+            MinStrideLengthPenalty(scale=-1.0),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -1244,7 +1297,7 @@ if __name__ == "__main__":
         HumanoidWalkingTaskConfig(
             # Training parameters.
             num_envs=4096,
-            batch_size=256,
+            batch_size=512,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
@@ -1254,12 +1307,13 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             iterations=8,
             ls_iterations=8,
-            action_latency_range=(0.001, 0.008),  # Simulate 3-10ms of latency.
+            action_latency_range=(0.001, 0.015),  # Simulate 1-15ms of latency.
             drop_action_prob=0.05,  # Drop 5% of commands.
             # Visualization parameters.
             render_track_body_id=0,
             render_markers=True,
             # Checkpointing parameters.
             save_every_n_seconds=60,
+            only_save_most_recent=False,
         ),
     )
